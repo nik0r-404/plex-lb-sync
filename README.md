@@ -10,6 +10,9 @@ Submit Plex playback history to ListenBrainz — including tracks played offline
 > respective owners. The software is provided as-is, without any warranty — see
 > [LICENSE](LICENSE).
 
+## Personal Disclaimer
+My skills are pretty shitty, so this is a combination of me and the help of ai. I'm pretty sure there is a lot to improve, but it works for me.
+
 ## The problem
 
 If you use [multi-scrobbler](https://github.com/FoxxMD/multi-scrobbler) to send
@@ -115,7 +118,13 @@ route here.
 **1. Enable SSH** — Control Panel → Telnet/SSH → *Allow SSH connection*. Then
 connect from your machine: `ssh admin@<nas-ip>`.
 
-**2. Get the project onto the NAS**
+**2. Get the project onto the NAS** — pick whichever of the three fits. Note
+that QNAP does not ship `git` by default; `which git` tells you whether yours
+has it. Installing it (via Entware) adds a second package manager next to QTS
+that firmware updates can break, so it is rarely worth it just to clone a repo —
+options B and C avoid it entirely.
+
+*Option A — clone it, if `git` is available:*
 
 ```bash
 mkdir -p /share/Container/plex-lb-sync-app
@@ -123,13 +132,27 @@ cd /share/Container/plex-lb-sync-app
 git clone https://github.com/nik0r-404/multi-scrobbler-Plex-offline-sync.git .
 ```
 
-If `git` is unavailable on your NAS, download the archive instead:
+*Option B — download the archive:*
 
 ```bash
+mkdir -p /share/Container/plex-lb-sync-app
+cd /share/Container/plex-lb-sync-app
 curl -L -o repo.zip https://github.com/nik0r-404/multi-scrobbler-Plex-offline-sync/archive/refs/heads/main.zip
 unzip repo.zip && mv multi-scrobbler-Plex-offline-sync-main/* . \
   && rm -rf repo.zip multi-scrobbler-Plex-offline-sync-main
 ```
+
+*Option C — copy it from your own machine.* Handy if you already have the
+project checked out locally, or intend to make changes to it: no `git` on the
+NAS and no download from the internet. Run this on your machine, not on the NAS:
+
+```bash
+rsync -av --exclude '.git' --exclude '.venv' --exclude '.env' --exclude 'data' \
+  /path/to/plex-lb-sync/ admin@<nas-ip>:/share/Container/plex-lb-sync-app/
+```
+
+`.env` is excluded on purpose: the NAS needs its own, with the paths and volume
+layout used there. Use `scp -r` if `rsync` is missing.
 
 **3. Create the data directory with the right ownership** — the container runs
 unprivileged as UID 1000, so the directory holding `state.json` must belong to
@@ -190,13 +213,27 @@ The container then runs every 15 minutes and comes back after a NAS reboot via
 where you can read logs and stop or start it — but keep managing its
 configuration over SSH, otherwise the UI and the compose file drift apart.
 
-To update later:
+**Updating later** — fetch the new version the same way you installed it, then
+rebuild. The `--build` is what matters: without it Docker reuses the old image
+and nothing changes.
 
 ```bash
 cd /share/Container/plex-lb-sync-app
-git pull
+
+git pull                      # option A
+# or re-download and unpack the archive over it   (option B)
+# or rsync from your machine again                (option C)
+
 docker compose up -d --build
+docker compose logs -f
 ```
+
+Your `.env` and the state file live outside the image — the first next to the
+compose file, the second in the mounted directory — so an update touches
+neither. Already-submitted tracks are not submitted again.
+
+If a rebuild goes wrong, `docker compose down` stops everything and the previous
+image is still there; `docker image ls` lists what you can roll back to.
 
 ### On other NAS systems
 
