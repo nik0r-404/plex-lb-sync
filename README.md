@@ -105,24 +105,103 @@ State lives in `data/state.json` via the volume mount, so it survives restarts.
 Set `DRY_RUN: "true"` in `docker-compose.yaml` for the first start, watch the
 logs, then switch it back to `"false"` and run `docker compose up -d` again.
 
-### On a NAS
+### Installing on a QNAP NAS
 
-The `docker-compose.yaml` mounts `./data`. On a NAS such as QNAP or Synology,
-point that at a share instead and create it beforehand:
+Container Station 3.x. The compose file uses `build: .`, so the image is built
+from source rather than pulled from a registry — Container Station's "create
+application" dialog has no build context for that, which makes SSH the reliable
+route here.
 
-```yaml
-    volumes:
-      - /share/Container/plex-lb-sync:/data
+**1. Enable SSH** — Control Panel → Telnet/SSH → *Allow SSH connection*. Then
+connect from your machine: `ssh admin@<nas-ip>`.
+
+**2. Get the project onto the NAS**
+
+```bash
+mkdir -p /share/Container/plex-lb-sync-app
+cd /share/Container/plex-lb-sync-app
+git clone https://github.com/nik0r-404/multi-scrobbler-Plex-offline-sync.git .
 ```
+
+If `git` is unavailable on your NAS, download the archive instead:
+
+```bash
+curl -L -o repo.zip https://github.com/nik0r-404/multi-scrobbler-Plex-offline-sync/archive/refs/heads/main.zip
+unzip repo.zip && mv multi-scrobbler-Plex-offline-sync-main/* . \
+  && rm -rf repo.zip multi-scrobbler-Plex-offline-sync-main
+```
+
+**3. Create the data directory with the right ownership** — the container runs
+unprivileged as UID 1000, so the directory holding `state.json` must belong to
+that UID. Otherwise the container starts fine and then cannot write:
 
 ```bash
 mkdir -p /share/Container/plex-lb-sync
-chown 1000:1000 /share/Container/plex-lb-sync
+chown -R 1000:1000 /share/Container/plex-lb-sync
 ```
 
-The directory must be writable by UID 1000 — the container deliberately does not
-run as root. Also set `TZ` in your `.env` so log timestamps match your local
-time, e.g. `TZ=Europe/Berlin`.
+**4. Point the volume at that directory** — the compose file ships with
+`./data:/data`:
+
+```bash
+sed -i 's#- ./data:/data#- /share/Container/plex-lb-sync:/data#' docker-compose.yaml
+```
+
+**5. Create the `.env`**
+
+```bash
+cp .env.example .env
+vi .env
+chmod 600 .env        # it holds your tokens
+```
+
+```
+PLEX_URL=http://<nas-ip>:32400
+PLEX_TOKEN=your-plex-token
+LISTENBRAINZ_TOKEN=your-listenbrainz-token
+PLEX_ACCOUNT_ID=1
+TZ=Europe/Berlin
+```
+
+Use the NAS IP in `PLEX_URL` even when Plex runs on the same NAS — inside the
+container, `localhost` refers to the container itself. The variables at the
+bottom of `.env` (`STATE_FILE`, `DRY_RUN`, `RUN_ONCE`, …) only apply to local
+runs outside Docker; the compose file overrides them.
+
+**6. Do a dry run first**
+
+```bash
+docker compose run --rm -e DRY_RUN=true -e RUN_ONCE=true plex-lb-sync
+```
+
+The first invocation builds the image, which takes a minute or two. If
+`docker compose` is not found, try `docker-compose` — the command name differs
+between Container Station versions.
+
+**7. Start it for good**
+
+```bash
+docker compose up -d
+docker compose logs -f          # Ctrl+C only stops the log view
+```
+
+The container then runs every 15 minutes and comes back after a NAS reboot via
+`restart: unless-stopped`. It shows up under *Containers* in Container Station,
+where you can read logs and stop or start it — but keep managing its
+configuration over SSH, otherwise the UI and the compose file drift apart.
+
+To update later:
+
+```bash
+cd /share/Container/plex-lb-sync-app
+git pull
+docker compose up -d --build
+```
+
+### On other NAS systems
+
+The same principles apply: mount a share into `/data`, make it writable by UID
+1000, and set `TZ` so log timestamps match local time.
 
 ## Configuration
 
@@ -326,6 +405,21 @@ Log lines you may see:
 | `SKIP` | Entry incomplete or timestamp in the future |
 | `RETRY` | Temporary failure, will be attempted again next run |
 | `DROP` | Permanently rejected by ListenBrainz, will not be retried |
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `Missing environment variables` | `.env` is not next to `docker-compose.yaml`, or the values are empty |
+| `State file /data/state.json is not writable` | The mounted directory does not belong to UID 1000 |
+| `Plex request failed: ... Connection refused` | Wrong `PLEX_URL`, or `localhost` used from inside the container |
+| `No music library found` | The token belongs to a user without access to the library, or there is no library of type `artist` |
+| `Plex history: 0 track entries in the window` | Nothing was played inside `LOOKBACK_HOURS` — or the Plex token belongs to a different account than `PLEX_ACCOUNT_ID` |
+| Container runs but never submits anything | `DRY_RUN` is still `"true"` in `docker-compose.yaml` |
+| Log timestamps in the wrong timezone | `TZ` is not set |
+
+For a closer look at what Plex reports, run `verify_plex_history.py` — see
+[Verifying your setup](#verifying-your-setup).
 
 ## Limitations
 
