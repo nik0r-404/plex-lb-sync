@@ -1,0 +1,44 @@
+services:
+  plex-lb-sync:
+    build: .
+    # Or use a prebuilt image instead:
+    # image: plex-lb-sync:1.0.0
+    container_name: plex-lb-sync
+    restart: unless-stopped
+    environment:
+      # Timezone of the log output.
+      TZ: ${TZ:-UTC}
+
+      # --- Required ---
+      PLEX_URL: ${PLEX_URL}
+      PLEX_TOKEN: ${PLEX_TOKEN}
+      LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN}
+
+      # --- Optional ---
+      # Only scrobble plays of this Plex user (accountID as shown in the history).
+      PLEX_ACCOUNT_ID: ${PLEX_ACCOUNT_ID:-}
+      # ID of the music library. Empty = auto-detected (library of type "artist").
+      PLEX_LIBRARY_SECTION: ${PLEX_LIBRARY_SECTION:-}
+      # How far back each run looks. This also covers offline periods: if you
+      # listen without a connection for longer, raise it (e.g. 168 = 7 days).
+      LOOKBACK_HOURS: "72"
+      # Tolerance when cross-checking against listens that already exist.
+      # Prevents double scrobbles when another scrobbler already reported the
+      # same track (its timestamp is 1-2 minutes earlier). 0 = cross-check off.
+      DUPLICATE_WINDOW_SECONDS: "600"
+      # Delay between two passes.
+      INTERVAL_MINUTES: "15"
+      # Keep this at "true" for the first test, then switch it to "false".
+      DRY_RUN: "false"
+      STATE_FILE: /data/state.json
+      # LOG_LEVEL: DEBUG
+    volumes:
+      # Holds state.json. The directory must be writable by UID 1000 (the
+      # container runs unprivileged). On a NAS, point this at a share instead,
+      # e.g. /share/Container/plex-lb-sync:/data
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
