@@ -52,7 +52,7 @@ def find_music_section(url: str, token: str) -> str:
     )
     resp.raise_for_status()
     for section in resp.json().get("MediaContainer", {}).get("Directory", []):
-        if section.get("type") == "artist":
+        if isinstance(section, dict) and section.get("type") == "artist":
             return str(section.get("key"))
     return ""
 

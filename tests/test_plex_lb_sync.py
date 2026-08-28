@@ -92,8 +92,8 @@ class SelectNewTest(unittest.TestCase):
         self.assertEqual([e["historyKey"] for e in result], ["b"])
 
     def test_backdated_offline_entry_is_still_picked_up(self):
-        """Offline plays reported later can be older than the high-water mark."""
-        state = sync.State(last_submitted_at=500, seen={"recent": 500})
+        """Offline plays reported later can be older than the newest submission."""
+        state = sync.State(seen={"recent": 500})
         entries = [entry(historyKey="offline", viewedAt=200), entry(historyKey="recent", viewedAt=500)]
         result = sync.select_new(entries, state, window_start=0, account_id="")
         self.assertEqual([e["historyKey"] for e in result], ["offline"])
@@ -155,9 +155,8 @@ class StateRoundTripTest(unittest.TestCase):
     def test_save_and_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sub", "state.json")
-            sync.save_state(path, sync.State(last_submitted_at=5, last_run_at=7, seen={"a": 5}))
+            sync.save_state(path, sync.State(last_run_at=7, seen={"a": 5}))
             loaded = sync.load_state(path)
-            self.assertEqual(loaded.last_submitted_at, 5)
             self.assertEqual(loaded.last_run_at, 7)
             self.assertEqual(loaded.seen, {"a": 5})
             self.assertFalse(loaded.is_fresh)
@@ -266,11 +265,32 @@ class FetchHistoryTest(unittest.TestCase):
         self.assertEqual([e["historyKey"] for e in result], ["/status/sessions/history/1"])
 
     def test_ignores_repeated_entries_across_pages(self):
-        # Plex does not honour X-Plex-Container-Start in every combination.
+        # Plex does not honour X-Plex-Container-Start in every combination; a
+        # page without any new entries must also end the pagination.
         page = [entry(historyKey=f"/h/{i}") for i in range(sync.PLEX_PAGE_SIZE)]
-        session = FakeSession(self.sections, [page, page, []])
+        session = FakeSession(self.sections, [page, page, page])
         result = sync.fetch_history(config(), session, since=1_600_000_000)
         self.assertEqual(len(result), sync.PLEX_PAGE_SIZE)
+        # 1x /library/sections + 2x history: the repeated page stops the loop.
+        self.assertEqual(len(session.calls), 3)
+
+    def test_single_outlier_does_not_abort_pagination(self):
+        page1 = [
+            entry(historyKey=f"/h/a{i}", viewedAt=1_700_000_000 - i)
+            for i in range(sync.PLEX_PAGE_SIZE - 1)
+        ]
+        page1.append(entry(historyKey="/h/outlier", viewedAt=1_500_000_000))
+        page2 = [
+            entry(historyKey=f"/h/b{i}", viewedAt=1_690_000_000 - i)
+            for i in range(sync.PLEX_PAGE_SIZE)
+        ]
+        old_page = [
+            entry(historyKey=f"/h/c{i}", viewedAt=1_400_000_000 - i)
+            for i in range(sync.PLEX_PAGE_SIZE)
+        ]
+        session = FakeSession(self.sections, [page1, page2, old_page])
+        result = sync.fetch_history(config(), session, since=1_600_000_000)
+        self.assertEqual(len(result), 2 * sync.PLEX_PAGE_SIZE - 1)
 
 
 class IsDuplicateTest(unittest.TestCase):
@@ -304,6 +324,13 @@ class IsDuplicateTest(unittest.TestCase):
         existing = {("fleetwood mac", "dreams"): [1_700_000_000]}
         self.assertIsNone(sync.is_duplicate(self.listen(at=1_700_003_600), existing, 600))
 
+    def test_match_is_consumed(self):
+        # One existing listen may absorb only one Plex play: a genuine repeat
+        # play right after it must still be submitted.
+        existing = {("fleetwood mac", "dreams"): [1_700_000_030]}
+        self.assertEqual(sync.is_duplicate(self.listen(), existing, 600), 1_700_000_030)
+        self.assertIsNone(sync.is_duplicate(self.listen(at=1_700_000_180), existing, 600))
+
 
 class FetchExistingListensTest(unittest.TestCase):
     class Session(FakeSession):
@@ -335,6 +362,133 @@ class FetchExistingListensTest(unittest.TestCase):
 
         # None means "do not filter" -- a failed lookup must not swallow anything.
         self.assertIsNone(sync.fetch_existing_listens(config(), Broken([], []), since=0))
+
+    def test_pagination_keeps_boundary_timestamps(self):
+        # max_ts is exclusive: listens sharing the timestamp at a page break
+        # must be re-fetched (and not counted twice).
+        page1 = [
+            {"listened_at": 1000 - i, "track_metadata": {"artist_name": "A", "track_name": f"T{i}"}}
+            for i in range(sync.LB_LISTENS_PAGE_SIZE)
+        ]
+        boundary = page1[-1]  # listened_at == 901
+        page2 = [
+            dict(boundary),
+            {"listened_at": 900, "track_metadata": {"artist_name": "B", "track_name": "Y"}},
+        ]
+        session = self.Session("testuser", [page1, page2])
+        index = sync.fetch_existing_listens(config(), session, since=0)
+        self.assertEqual(session.calls[-1][1]["max_ts"], 902)
+        self.assertEqual(index[("b", "y")], [900])
+        self.assertEqual(index[("a", f"t{sync.LB_LISTENS_PAGE_SIZE - 1}")], [901])
+
+
+class FakePostResponse:
+    def __init__(self, status_code, headers=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+
+
+class PostSession:
+    """Stand-in for requests.Session covering only POST."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append((url, json))
+        return self.responses.pop(0)
+
+
+class SubmitListensTest(unittest.TestCase):
+    def listen(self, at=1_700_000_000):
+        return {"listened_at": at, "track_metadata": {"artist_name": "A", "track_name": "X"}}
+
+    def test_single_listen_uses_listen_type_single(self):
+        session = PostSession([FakePostResponse(200)])
+        result = sync.submit_listens(config(), session, [self.listen()])
+        self.assertEqual(result, sync.SubmitResult.SENT)
+        self.assertEqual(session.calls[0][1]["listen_type"], "single")
+
+    def test_batch_uses_listen_type_import(self):
+        session = PostSession([FakePostResponse(200)])
+        result = sync.submit_listens(config(), session, [self.listen(1), self.listen(2)])
+        self.assertEqual(result, sync.SubmitResult.SENT)
+        self.assertEqual(session.calls[0][1]["listen_type"], "import")
+
+    def test_rejected_token_stops_immediately(self):
+        session = PostSession([FakePostResponse(401)])
+        result = sync.submit_listens(config(), session, [self.listen()])
+        self.assertEqual(result, sync.SubmitResult.AUTH_FAILURE)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_client_error_is_permanent(self):
+        session = PostSession([FakePostResponse(400)])
+        result = sync.submit_listens(config(), session, [self.listen()])
+        self.assertEqual(result, sync.SubmitResult.PERMANENT_FAILURE)
+        self.assertEqual(len(session.calls), 1)
+
+
+class RunOnceTest(unittest.TestCase):
+    class Session(FakeSession):
+        def __init__(self, sections, history_pages, post_responses):
+            super().__init__(sections, history_pages)
+            self.post_responses = list(post_responses)
+            self.posts = []
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            self.posts.append((url, json))
+            return self.post_responses.pop(0)
+
+    def setUp(self):
+        sync._section_cache.clear()
+        self.sections = [{"key": 3, "type": "artist", "title": "Music"}]
+        self.now = 1_700_003_600
+
+    def history(self):
+        return [
+            entry(historyKey="/h/1", viewedAt=1_700_000_000),
+            entry(historyKey="/h/2", viewedAt=1_700_000_100),
+        ]
+
+    def test_submits_batch_and_persists_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            session = self.Session(self.sections, [self.history()], [FakePostResponse(200)])
+            cfg = config(dry_run=False, duplicate_window=0, state_file=path)
+            sent = sync.run_once(cfg, session, now=self.now)
+            self.assertEqual(sent, 2)
+            self.assertEqual(session.posts[0][1]["listen_type"], "import")
+            self.assertEqual(sorted(sync.load_state(path).seen), ["/h/1", "/h/2"])
+
+    def test_bad_listen_is_isolated_and_dropped(self):
+        # The rejected batch is bisected; the bad listen is dropped, the good
+        # one is still submitted.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            session = self.Session(
+                self.sections,
+                [self.history()],
+                [FakePostResponse(400), FakePostResponse(200), FakePostResponse(400)],
+            )
+            cfg = config(dry_run=False, duplicate_window=0, state_file=path)
+            sent = sync.run_once(cfg, session, now=self.now)
+            self.assertEqual(sent, 1)
+            self.assertEqual(len(session.posts), 3)
+            # Both are remembered: one as sent, one as permanently rejected.
+            self.assertEqual(sorted(sync.load_state(path).seen), ["/h/1", "/h/2"])
+
+    def test_rejected_token_aborts_the_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            session = self.Session(self.sections, [self.history()], [FakePostResponse(401)])
+            cfg = config(dry_run=False, duplicate_window=0, state_file=path)
+            sent = sync.run_once(cfg, session, now=self.now)
+            self.assertEqual(sent, 0)
+            self.assertEqual(len(session.posts), 1)
+            # Nothing is marked seen -- everything is retried after the fix.
+            self.assertEqual(sync.load_state(path).seen, {})
 
 
 if __name__ == "__main__":

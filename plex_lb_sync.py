@@ -24,14 +24,15 @@ from typing import Any
 
 import requests
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CLIENT_NAME = "plex-lb-sync"
 PLEX_TRACK_TYPE = "track"  # value of the "type" field in a history entry
 PLEX_PAGE_SIZE = 100
-PLEX_MAX_PAGES = 50  # safety net against never-ending pagination
 LB_MAX_ATTEMPTS = 3
 LB_LISTENS_PAGE_SIZE = 100  # maximum of the /1/user/<name>/listens endpoint
+LB_SUBMIT_BATCH_SIZE = 50  # listens per submit-listens request (listen_type "import")
+LB_MAX_RATE_WAIT = 300  # upper bound for the wait suggested by X-RateLimit-Reset-In
 STATE_VERSION = 1
 
 log = logging.getLogger(CLIENT_NAME)
@@ -80,6 +81,7 @@ class Config:
     interval_minutes: int
     run_once: bool
     request_timeout: int
+    plex_max_pages: int = 50  # safety net against never-ending pagination
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -115,6 +117,7 @@ class Config:
             interval_minutes=env_int("INTERVAL_MINUTES", 15, minimum=1),
             run_once=env_bool("RUN_ONCE", False),
             request_timeout=env_int("REQUEST_TIMEOUT", 30, minimum=1),
+            plex_max_pages=env_int("PLEX_MAX_PAGES", 50, minimum=1),
         )
 
 
@@ -127,15 +130,13 @@ class State:
     """What has already been submitted successfully.
 
     ``seen`` maps Plex history entries to their ``viewedAt`` timestamp and is
-    only extended after a successful submission. ``last_submitted_at`` is a
-    high-water mark kept for logging; the selection of entries to submit
-    deliberately goes through ``seen`` instead: because Plex records the real
-    listening time when a client reports offline plays, those entries appear
-    *behind* the high-water mark and a plain timestamp comparison would swallow
-    them.
+    only extended after a successful submission. The selection of entries to
+    submit deliberately goes through ``seen`` instead of a plain high-water
+    timestamp: because Plex records the real listening time when a client
+    reports offline plays, those entries appear *behind* the newest submission
+    and a timestamp comparison would swallow them.
     """
 
-    last_submitted_at: int = 0
     last_run_at: int = 0
     seen: dict[str, int] = None  # type: ignore[assignment]
 
@@ -179,7 +180,6 @@ def load_state(path: str) -> State:
             return 0
 
     return State(
-        last_submitted_at=as_int(raw.get("last_submitted_at")),
         last_run_at=as_int(raw.get("last_run_at")),
         seen=seen,
     )
@@ -188,7 +188,6 @@ def load_state(path: str) -> State:
 def save_state(path: str, state: State) -> None:
     payload = {
         "version": STATE_VERSION,
-        "last_submitted_at": state.last_submitted_at,
         "last_run_at": state.last_run_at,
         "seen": state.seen,
     }
@@ -319,7 +318,9 @@ def fetch_history(config: Config, session: requests.Session, since: int) -> list
         # Evaluate the whole page instead of stopping at the first old entry: a
         # single outlier in the sort order would otherwise silently swallow
         # everything behind it.
+        in_window = 0
         outside_window = 0
+        added = 0
         for entry in page:
             if not isinstance(entry, dict):
                 continue
@@ -331,6 +332,7 @@ def fetch_history(config: Config, session: requests.Session, since: int) -> list
             if viewed_at < since:
                 outside_window += 1
                 continue
+            in_window += 1
             # Plex does not honour X-Plex-Container-Start in every combination;
             # without this guard the same entry would be collected repeatedly.
             key = entry_key(entry)
@@ -338,16 +340,30 @@ def fetch_history(config: Config, session: requests.Session, since: int) -> list
                 continue
             known.add(key)
             collected.append(entry)
+            added += 1
 
-        # The sort order is descending: once a page contains entries outside the
-        # window, nothing relevant follows.
-        if outside_window or len(page) < PLEX_PAGE_SIZE:
+        if len(page) < PLEX_PAGE_SIZE:
+            break
+        # The sort order is descending: a page with no in-window entries at all
+        # means everything that follows is older still. A page that merely
+        # *contains* old entries is not enough -- a single sort-order outlier
+        # must not abort the pagination.
+        if outside_window and not in_window:
+            break
+        if in_window and not added:
+            log.warning(
+                "Plex returned no new entries at offset %d -- stopping pagination "
+                "(X-Plex-Container-Start is likely being ignored; entries beyond "
+                "this point cannot be fetched).",
+                start,
+            )
             break
         start += PLEX_PAGE_SIZE
-        if start >= PLEX_PAGE_SIZE * PLEX_MAX_PAGES:
-            log.warning(
-                "Stopping after %d pages of Plex history -- LOOKBACK_HOURS may be too large.",
-                PLEX_MAX_PAGES,
+        if start >= PLEX_PAGE_SIZE * config.plex_max_pages:
+            log.error(
+                "Stopping after %d pages of Plex history -- older plays in the window "
+                "are not fetched. Raise PLEX_MAX_PAGES or lower LOOKBACK_HOURS.",
+                config.plex_max_pages,
             )
             break
 
@@ -368,8 +384,8 @@ def select_new(
         if entry_key(entry) in state.seen:
             continue
         candidates.append(entry)
-    # Submit in ascending order so the high-water mark grows monotonically and an
-    # abort halfway through a run does not skip anything.
+    # Submit in ascending order so an abort halfway through a run leaves the
+    # remaining (newer) entries for the next pass without skipping anything.
     candidates.sort(key=lambda item: item["viewedAt"])
     return candidates
 
@@ -390,6 +406,7 @@ class SubmitResult:
     SENT = "sent"
     PERMANENT_FAILURE = "permanent"
     TEMPORARY_FAILURE = "temporary"
+    AUTH_FAILURE = "auth"  # token rejected -- retrying other listens is pointless
 
 
 def build_listen(entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -423,63 +440,61 @@ def build_listen(entry: dict[str, Any]) -> dict[str, Any] | None:
     return {"listened_at": viewed_at, "track_metadata": track_metadata}
 
 
-def submit_listen(config: Config, session: requests.Session, listen: dict[str, Any]) -> str:
-    """Submit a single listen. Returns a ``SubmitResult`` value."""
+def submit_listens(config: Config, session: requests.Session, listens: list[dict[str, Any]]) -> str:
+    """Submit one or more listens in a single request. Returns a ``SubmitResult`` value."""
     url = f"{config.listenbrainz_url}/1/submit-listens"
-    body = {"listen_type": "single", "payload": [listen]}
+    body = {"listen_type": "import" if len(listens) > 1 else "single", "payload": listens}
     headers = {
         "Authorization": f"Token {config.listenbrainz_token}",
         "Content-Type": "application/json",
     }
 
     for attempt in range(1, LB_MAX_ATTEMPTS + 1):
+        wait: float = 2 ** attempt
         try:
             response = session.post(url, json=body, headers=headers, timeout=config.request_timeout)
         except requests.RequestException as exc:
             log.warning("ListenBrainz unreachable (attempt %d/%d): %s", attempt, LB_MAX_ATTEMPTS, exc)
-            if attempt == LB_MAX_ATTEMPTS:
-                return SubmitResult.TEMPORARY_FAILURE
-            time.sleep(2 ** attempt)
-            continue
+        else:
+            if response.status_code in (200, 201):
+                return SubmitResult.SENT
 
-        if response.status_code in (200, 201):
-            return SubmitResult.SENT
+            if response.status_code in (401, 403):
+                log.error(
+                    "ListenBrainz rejected the token (HTTP %d): %s",
+                    response.status_code,
+                    response.text[:300],
+                )
+                return SubmitResult.AUTH_FAILURE
 
-        if response.status_code == 429:
-            wait = 5
-            try:
-                wait = max(1, int(response.headers.get("X-RateLimit-Reset-In", "5")))
-            except ValueError:
-                pass
-            log.info("ListenBrainz rate limit -- waiting %ds (attempt %d/%d).", wait, attempt, LB_MAX_ATTEMPTS)
-            if attempt == LB_MAX_ATTEMPTS:
-                return SubmitResult.TEMPORARY_FAILURE
-            time.sleep(wait)
-            continue
+            if response.status_code == 429:
+                try:
+                    wait = min(max(1, int(response.headers.get("X-RateLimit-Reset-In", "5"))), LB_MAX_RATE_WAIT)
+                except ValueError:
+                    wait = 5
+                log.info(
+                    "ListenBrainz rate limit -- waiting %ds (attempt %d/%d).", wait, attempt, LB_MAX_ATTEMPTS
+                )
+            elif 400 <= response.status_code < 500:
+                # The payload itself is wrong -- retrying will not change anything.
+                log.error(
+                    "ListenBrainz permanently rejected the submission (HTTP %d): %s",
+                    response.status_code,
+                    response.text[:300],
+                )
+                return SubmitResult.PERMANENT_FAILURE
+            else:
+                log.warning(
+                    "ListenBrainz server error (HTTP %d, attempt %d/%d): %s",
+                    response.status_code,
+                    attempt,
+                    LB_MAX_ATTEMPTS,
+                    response.text[:200],
+                )
 
-        if response.status_code in (401, 403):
-            log.error("ListenBrainz rejected the token (HTTP %d): %s", response.status_code, response.text[:300])
-            return SubmitResult.TEMPORARY_FAILURE
-
-        if 400 <= response.status_code < 500:
-            # The payload itself is wrong -- retrying will not change anything.
-            log.error(
-                "ListenBrainz permanently rejected the listen (HTTP %d): %s",
-                response.status_code,
-                response.text[:300],
-            )
-            return SubmitResult.PERMANENT_FAILURE
-
-        log.warning(
-            "ListenBrainz server error (HTTP %d, attempt %d/%d): %s",
-            response.status_code,
-            attempt,
-            LB_MAX_ATTEMPTS,
-            response.text[:200],
-        )
-        if attempt == LB_MAX_ATTEMPTS:
-            return SubmitResult.TEMPORARY_FAILURE
-        time.sleep(2 ** attempt)
+        if attempt == LB_MAX_ATTEMPTS or _stop:
+            break
+        sleep_interruptible(wait)
 
     return SubmitResult.TEMPORARY_FAILURE
 
@@ -516,6 +531,7 @@ def fetch_existing_listens(
             return None
 
         index: dict[tuple[str, str], list[int]] = {}
+        counted: set[tuple[tuple[str, str], int]] = set()
         max_ts: int | None = None
         while True:
             params: dict[str, Any] = {"min_ts": since, "count": LB_LISTENS_PAGE_SIZE}
@@ -531,6 +547,7 @@ def fetch_existing_listens(
             listens = response.json().get("payload", {}).get("listens", [])
             if not listens:
                 break
+            added = 0
             for listen in listens:
                 metadata = listen.get("track_metadata") or {}
                 listened_at = listen.get("listened_at")
@@ -539,10 +556,24 @@ def fetch_existing_listens(
                 fingerprint = listen_fingerprint(
                     str(metadata.get("artist_name") or ""), str(metadata.get("track_name") or "")
                 )
+                # Pages overlap by one second (see max_ts below) -- do not count
+                # the same listen twice.
+                marker = (fingerprint, listened_at)
+                if marker in counted:
+                    continue
+                counted.add(marker)
                 index.setdefault(fingerprint, []).append(listened_at)
+                added += 1
             if len(listens) < LB_LISTENS_PAGE_SIZE:
                 break
-            max_ts = min(l["listened_at"] for l in listens if isinstance(l.get("listened_at"), int))
+            stamps = [l["listened_at"] for l in listens if isinstance(l.get("listened_at"), int)]
+            if not stamps or not added:
+                # Nothing usable on the page, or no progress (a page full of
+                # listens sharing one timestamp) -- do not loop forever.
+                break
+            # max_ts is exclusive: +1 keeps listens that share the boundary
+            # timestamp across a page break in the index.
+            max_ts = min(stamps) + 1
     except requests.RequestException as exc:
         log.warning("Could not fetch existing listens (%s) -- not filtering.", exc)
         return None
@@ -563,6 +594,9 @@ def is_duplicate(
     ``viewedAt`` when the track ends -- so the same play reaches ListenBrainz
     with timestamps one to two minutes apart, and its own de-duplication (exact
     timestamp match) does not catch it. Hence this comparison with a tolerance.
+
+    A match is consumed from ``existing``: one existing listen may absorb only
+    one Plex play, so a genuine repeat play right after it is still submitted.
     """
     metadata = listen["track_metadata"]
     fingerprint = listen_fingerprint(metadata["artist_name"], metadata["track_name"])
@@ -571,7 +605,10 @@ def is_duplicate(
         return None
     listened_at = listen["listened_at"]
     nearest = min(candidates, key=lambda stamp: abs(stamp - listened_at))
-    return nearest if abs(nearest - listened_at) <= tolerance else None
+    if abs(nearest - listened_at) > tolerance:
+        return None
+    candidates.remove(nearest)
+    return nearest
 
 
 # --------------------------------------------------------------------------
@@ -618,13 +655,22 @@ def run_once(config: Config, session: requests.Session, now: int | None = None) 
 
     existing: dict[tuple[str, str], list[int]] | None = None
     if candidates and config.duplicate_window > 0:
-        existing = fetch_existing_listens(config, session, window_start)
+        if config.listenbrainz_token:
+            # Widen the range by the tolerance (and one second, min_ts is
+            # exclusive): a counterpart listen recorded just before the window
+            # edge must still take part in the cross-check.
+            existing = fetch_existing_listens(
+                config, session, window_start - config.duplicate_window - 1
+            )
+        else:
+            log.warning(
+                "No LISTENBRAINZ_TOKEN -- duplicate cross-check skipped; the dry-run "
+                "preview may list plays another scrobbler already submitted."
+            )
 
-    sent = 0
     skipped = 0
     duplicates = 0
-    failed = 0
-
+    to_submit: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for entry in candidates:
         listen = build_listen(entry)
         if listen is None:
@@ -649,35 +695,74 @@ def run_once(config: Config, session: requests.Session, now: int | None = None) 
                 duplicates += 1
                 continue
 
-        if config.dry_run:
-            log.info("DRY-RUN would submit: %s", describe(entry))
-            sent += 1
-            continue
+        to_submit.append((entry, listen))
 
-        result = submit_listen(config, session, listen)
+    if config.dry_run:
+        for entry, _ in to_submit:
+            log.info("DRY-RUN would submit: %s", describe(entry))
+        log.info(
+            "Dry run finished: %d listens would have been submitted, %d duplicates, %d skipped. "
+            "State file left untouched.",
+            len(to_submit),
+            duplicates,
+            skipped,
+        )
+        return len(to_submit)
+
+    sent = 0
+    failed = 0
+    # Submit in batches. A rejected batch is bisected until the offending listen
+    # is isolated: ListenBrainz validates the payload before storing anything,
+    # so nothing of a rejected batch was persisted and re-submitting is safe.
+    batches = [
+        to_submit[i : i + LB_SUBMIT_BATCH_SIZE]
+        for i in range(0, len(to_submit), LB_SUBMIT_BATCH_SIZE)
+    ]
+    while batches:
+        if _stop:
+            pending = sum(len(b) for b in batches)
+            log.info("Stop requested -- %d listens will be retried on the next run.", pending)
+            failed += pending
+            break
+        batch = batches.pop(0)
+        result = submit_listens(config, session, [listen for _, listen in batch])
         if result == SubmitResult.SENT:
-            log.info("SENT %s", describe(entry))
-            state.seen[entry_key(entry)] = entry["viewedAt"]
-            state.last_submitted_at = max(state.last_submitted_at, entry["viewedAt"])
-            sent += 1
+            for entry, _ in batch:
+                log.info("SENT %s", describe(entry))
+                state.seen[entry_key(entry)] = entry["viewedAt"]
+            sent += len(batch)
+            # Persist progress right away: a hard kill mid-pass must not lead to
+            # already-sent listens being submitted a second time.
+            try:
+                save_state(config.state_file, state)
+            except OSError as exc:
+                log.error("State file %s is not writable: %s", config.state_file, exc)
+        elif result == SubmitResult.AUTH_FAILURE:
+            pending = len(batch) + sum(len(b) for b in batches)
+            log.error(
+                "Aborting the pass -- LISTENBRAINZ_TOKEN is not accepted; %d listens "
+                "will be retried once the token is fixed.",
+                pending,
+            )
+            failed += pending
+            break
+        elif result == SubmitResult.PERMANENT_FAILURE and len(batch) > 1:
+            log.warning(
+                "ListenBrainz rejected a batch of %d -- isolating the bad listen.", len(batch)
+            )
+            middle = len(batch) // 2
+            batches.insert(0, batch[middle:])
+            batches.insert(0, batch[:middle])
         elif result == SubmitResult.PERMANENT_FAILURE:
+            entry = batch[0][0]
             log.error("DROP permanently rejected: %s", describe(entry))
             # Remember it so the entry does not fail again on every run.
             state.seen[entry_key(entry)] = entry["viewedAt"]
             failed += 1
         else:
-            log.warning("RETRY on the next run: %s", describe(entry))
-            failed += 1
-
-    if config.dry_run:
-        log.info(
-            "Dry run finished: %d listens would have been submitted, %d duplicates, %d skipped. "
-            "State file left untouched.",
-            sent,
-            duplicates,
-            skipped,
-        )
-        return sent
+            for entry, _ in batch:
+                log.warning("RETRY on the next run: %s", describe(entry))
+            failed += len(batch)
 
     pruned = prune_seen(state, window_start)
     state.last_run_at = now
@@ -712,19 +797,25 @@ def _handle_signal(signum: int, _frame: Any) -> None:
     log.info("Received signal %s -- stopping after the current pass.", signal.Signals(signum).name)
 
 
-def sleep_interruptible(seconds: int) -> None:
+def sleep_interruptible(seconds: float) -> None:
     deadline = time.monotonic() + seconds
     while not _stop and time.monotonic() < deadline:
-        time.sleep(min(1.0, deadline - time.monotonic()))
+        # max(0.0, ...): the deadline may pass between the loop condition and
+        # this call, and time.sleep raises on negative values.
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def configure_logging() -> None:
+    raw = os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    level = getattr(logging, raw, None)
     logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        level=level if isinstance(level, int) else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
     )
+    if not isinstance(level, int):
+        log.warning("Unknown LOG_LEVEL %r -- using INFO.", raw)
 
 
 def main() -> int:
@@ -737,6 +828,21 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # Fail fast when the state file cannot be written (typical cause: the /data
+    # bind mount is owned by root while the container runs as UID 1000) --
+    # running stateless would re-process and re-submit the window every pass.
+    if not config.dry_run:
+        try:
+            save_state(config.state_file, load_state(config.state_file))
+        except OSError as exc:
+            log.error(
+                "State file %s is not writable: %s -- fix the /data volume "
+                "permissions (see README) and restart.",
+                config.state_file,
+                exc,
+            )
+            return 2
 
     log.info(
         "%s %s started -- Plex %s, window %dh, state %s%s%s",

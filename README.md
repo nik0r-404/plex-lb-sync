@@ -41,8 +41,9 @@ multi-scrobbler; you do not have to replace it.
 - **Cross-checks against ListenBrainz** before submitting, so tracks another
   scrobbler already reported are not scrobbled twice
 - **Keeps a state file** so nothing is submitted repeatedly
-- **Fails softly**: a single failed track never aborts a run, and the state only
-  advances after a successful submission
+- **Fails softly**: a rejected track never aborts a run, and the state only
+  advances after a successful submission (only a rejected token stops the pass,
+  since retrying other tracks would be pointless)
 - **Dry-run mode** so you can see exactly what would be submitted
 - Small container, standard library plus `requests`
 
@@ -258,11 +259,14 @@ Everything is configured through environment variables:
 | `INTERVAL_MINUTES` | no | `15` | Delay between two passes |
 | `RUN_ONCE` | no | `false` | `true` = one pass, then exit (for testing or an external scheduler) |
 | `REQUEST_TIMEOUT` | no | `30` | Timeout in seconds for Plex and ListenBrainz calls |
+| `PLEX_MAX_PAGES` | no | `50` | Upper bound on Plex history pages per pass (100 entries each). Raise it if a pass logs that older plays were not fetched |
 | `LISTENBRAINZ_URL` | no | `https://api.listenbrainz.org` | For self-hosted ListenBrainz instances |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG` for more detail |
 | `TZ` | no | UTC | Timezone of the log output, e.g. `Europe/Berlin` |
 
-¹ Not needed in a dry run.
+¹ Not needed in a dry run — but without it the cross-check against existing
+listens is skipped, so the dry-run preview may list plays another scrobbler
+already submitted.
 
 ## Verifying your setup
 
@@ -420,7 +424,7 @@ docker compose run --rm -e RUN_ONCE=true plex-lb-sync
 ## Example output
 
 ```
-2026-01-15 22:10:01 INFO    plex-lb-sync 1.0.0 started -- Plex http://plex.local:32400, window 72h, state /data/state.json, accountID 1
+2026-01-15 22:10:01 INFO    plex-lb-sync 1.1.0 started -- Plex http://plex.local:32400, window 72h, state /data/state.json, accountID 1
 2026-01-15 22:10:01 INFO    Cross-check against existing listens is active (tolerance 600s). Set DUPLICATE_WINDOW_SECONDS=0 to disable it.
 2026-01-15 22:10:01 INFO    No state file at /data/state.json -- first run.
 2026-01-15 22:10:01 INFO    First run: looking back 72 hours (from 2026-01-12 22:10:01).

@@ -2,7 +2,7 @@ services:
   plex-lb-sync:
     build: .
     # Or use a prebuilt image instead:
-    # image: plex-lb-sync:1.0.0
+    # image: plex-lb-sync:1.1.0
     container_name: plex-lb-sync
     restart: unless-stopped
     environment:
