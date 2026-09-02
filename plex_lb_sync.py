@@ -31,6 +31,7 @@ PLEX_TRACK_TYPE = "track"  # value of the "type" field in a history entry
 PLEX_PAGE_SIZE = 100
 LB_MAX_ATTEMPTS = 3
 LB_LISTENS_PAGE_SIZE = 100  # maximum of the /1/user/<name>/listens endpoint
+LB_MAX_LISTEN_PAGES = 50  # safety net against never-ending pagination
 LB_SUBMIT_BATCH_SIZE = 50  # listens per submit-listens request (listen_type "import")
 LB_MAX_RATE_WAIT = 300  # upper bound for the wait suggested by X-RateLimit-Reset-In
 STATE_VERSION = 1
@@ -532,14 +533,11 @@ def fetch_existing_listens(
 
         index: dict[tuple[str, str], list[int]] = {}
         counted: set[tuple[tuple[str, str], int]] = set()
-        max_ts: int | None = None
-        while True:
-            params: dict[str, Any] = {"min_ts": since, "count": LB_LISTENS_PAGE_SIZE}
-            if max_ts is not None:
-                params["max_ts"] = max_ts
+        min_ts = since
+        for _ in range(LB_MAX_LISTEN_PAGES):
             response = session.get(
                 f"{config.listenbrainz_url}/1/user/{user}/listens",
-                params=params,
+                params={"min_ts": min_ts, "count": LB_LISTENS_PAGE_SIZE},
                 headers=headers,
                 timeout=config.request_timeout,
             )
@@ -556,7 +554,7 @@ def fetch_existing_listens(
                 fingerprint = listen_fingerprint(
                     str(metadata.get("artist_name") or ""), str(metadata.get("track_name") or "")
                 )
-                # Pages overlap by one second (see max_ts below) -- do not count
+                # Pages overlap by one second (see min_ts below) -- do not count
                 # the same listen twice.
                 marker = (fingerprint, listened_at)
                 if marker in counted:
@@ -571,9 +569,20 @@ def fetch_existing_listens(
                 # Nothing usable on the page, or no progress (a page full of
                 # listens sharing one timestamp) -- do not loop forever.
                 break
-            # max_ts is exclusive: +1 keeps listens that share the boundary
-            # timestamp across a page break in the index.
-            max_ts = min(stamps) + 1
+            # With min_ts set the endpoint anchors at the *bottom* of the range:
+            # it returns the oldest listens above it, merely printed newest
+            # first. Paging forward therefore means raising min_ts -- lowering
+            # max_ts instead walks back into the range already covered and the
+            # newest listens are never reached. min_ts is exclusive, so -1
+            # re-fetches the boundary timestamp and listens sharing it across a
+            # page break stay in the index.
+            min_ts = max(stamps) - 1
+        else:
+            log.warning(
+                "Stopped after %d pages of existing listens -- the cross-check window "
+                "may be incomplete.",
+                LB_MAX_LISTEN_PAGES,
+            )
     except requests.RequestException as exc:
         log.warning("Could not fetch existing listens (%s) -- not filtering.", exc)
         return None

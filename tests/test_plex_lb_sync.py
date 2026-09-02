@@ -363,23 +363,69 @@ class FetchExistingListensTest(unittest.TestCase):
         # None means "do not filter" -- a failed lookup must not swallow anything.
         self.assertIsNone(sync.fetch_existing_listens(config(), Broken([], []), since=0))
 
-    def test_pagination_keeps_boundary_timestamps(self):
-        # max_ts is exclusive: listens sharing the timestamp at a page break
-        # must be re-fetched (and not counted twice).
-        page1 = [
-            {"listened_at": 1000 - i, "track_metadata": {"artist_name": "A", "track_name": f"T{i}"}}
-            for i in range(sync.LB_LISTENS_PAGE_SIZE)
-        ]
-        boundary = page1[-1]  # listened_at == 901
-        page2 = [
-            dict(boundary),
-            {"listened_at": 900, "track_metadata": {"artist_name": "B", "track_name": "Y"}},
-        ]
-        session = self.Session("testuser", [page1, page2])
+    class ApiSession(FakeSession):
+        """Serves listens the way the real endpoint does.
+
+        With ``min_ts`` set, /1/user/<name>/listens anchors at the *bottom* of
+        the range: it returns the oldest listens above it, merely printed newest
+        first. Paging therefore has to raise min_ts, not lower max_ts.
+        """
+
+        def __init__(self, user, listens):
+            super().__init__([], [])
+            self.user = user
+            self.listens = sorted(listens, key=lambda item: item["listened_at"])
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append((url, dict(params or {})))
+            if url.endswith("/validate-token"):
+                return FakeResponse({"user_name": self.user})
+            above = [l for l in self.listens if l["listened_at"] > params["min_ts"]]
+            page = above[: params["count"]]
+            return FakeResponse({"payload": {"listens": list(reversed(page))}})
+
+    def test_pagination_reaches_the_newest_listens(self):
+        # Regression: paging by lowering max_ts walked back into the range
+        # already covered, so the index stopped after the first page and every
+        # listen beyond it stayed invisible to the cross-check.
+        total = sync.LB_LISTENS_PAGE_SIZE * 2 + 20
+        session = self.ApiSession("testuser", [
+            {"listened_at": 1000 + i, "track_metadata": {"artist_name": "A", "track_name": f"T{i}"}}
+            for i in range(total)
+        ])
         index = sync.fetch_existing_listens(config(), session, since=0)
-        self.assertEqual(session.calls[-1][1]["max_ts"], 902)
-        self.assertEqual(index[("b", "y")], [900])
-        self.assertEqual(index[("a", f"t{sync.LB_LISTENS_PAGE_SIZE - 1}")], [901])
+        self.assertEqual(sum(len(stamps) for stamps in index.values()), total)
+        self.assertEqual(index[("a", f"t{total - 1}")], [1000 + total - 1])
+        self.assertNotIn("max_ts", session.calls[-1][1])
+
+    def test_pagination_keeps_boundary_timestamps(self):
+        # min_ts is exclusive: the boundary timestamp is re-fetched so two
+        # listens sharing it across a page break both land in the index.
+        boundary = 1000 + sync.LB_LISTENS_PAGE_SIZE - 1
+        listens = [
+            {"listened_at": 1000 + i, "track_metadata": {"artist_name": "A", "track_name": f"T{i}"}}
+            for i in range(sync.LB_LISTENS_PAGE_SIZE - 1)
+        ]
+        listens += [
+            {"listened_at": boundary, "track_metadata": {"artist_name": "B", "track_name": "Y"}},
+            {"listened_at": boundary, "track_metadata": {"artist_name": "C", "track_name": "Z"}},
+            {"listened_at": 9999, "track_metadata": {"artist_name": "D", "track_name": "Last"}},
+        ]
+        session = self.ApiSession("testuser", listens)
+        index = sync.fetch_existing_listens(config(), session, since=0)
+        self.assertEqual(index[("b", "y")], [boundary])
+        self.assertEqual(index[("c", "z")], [boundary])
+        self.assertEqual(index[("d", "last")], [9999])
+
+    def test_pagination_stops_at_the_page_cap(self):
+        # A page full of listens sharing one timestamp makes no progress; the
+        # loop must not spin forever.
+        session = self.ApiSession("testuser", [
+            {"listened_at": 1000, "track_metadata": {"artist_name": "A", "track_name": f"T{i}"}}
+            for i in range(sync.LB_LISTENS_PAGE_SIZE * 3)
+        ])
+        sync.fetch_existing_listens(config(), session, since=0)
+        self.assertLessEqual(len(session.calls), sync.LB_MAX_LISTEN_PAGES + 1)
 
 
 class FakePostResponse:
